@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import abc
 from ..algorithms import core as alg
 from ..utils.types import NodeType, ValidationResult, ValidationError, ExecutionError
-from ..utils.image_io import read_image, write_image
+from ..utils.image_io import read_image, write_image, predict_output_filename
 from ..algorithms.core import Image
 
 class PipelineNode(abc.ABC):
@@ -360,15 +360,12 @@ class OutputNode(PipelineNode):
         params = self.effective_params()
         if output_dir and input_filename:
             import os
-            stem, ext = os.path.splitext(input_filename)
-            suffix = params.get('suffix', '')
             fmt = params.get('format')
-            if fmt:
-                fmt_to_ext = {'PNG': '.png', 'JPEG': '.jpg', 'BMP': '.bmp', 'TIFF': '.tif', 'WEBP': '.webp'}
-                out_ext = fmt_to_ext.get(fmt.upper(), ext)
-            else:
-                out_ext = ext if ext else '.png'
-            out_name = f'{stem}{suffix}{out_ext}'
+            out_name = predict_output_filename(
+                input_filename,
+                suffix=params.get('suffix', '') or '',
+                fmt=fmt,
+            )
             out_path = os.path.join(output_dir, out_name)
             try:
                 write_image(img, out_path, fmt=fmt, quality=int(params.get('quality', 90)))

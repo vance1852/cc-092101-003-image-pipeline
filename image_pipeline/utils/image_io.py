@@ -112,6 +112,24 @@ def is_valid_image(path: str) -> bool:
         return False
 SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp', '.gif'}
 
+FORMAT_TO_EXT = {'PNG': '.png', 'JPEG': '.jpg', 'BMP': '.bmp', 'TIFF': '.tif', 'WEBP': '.webp'}
+
+
+def predict_output_filename(input_filename: str, suffix: str = '', fmt: str = None) -> str:
+    """Predict the output filename an OutputNode writes for an input filename.
+
+    Single source of truth shared by OutputNode.execute, candidate discovery
+    and the dry-run command, so exclusion logic can never drift from the names
+    the pipeline actually writes.
+    """
+    stem, ext = os.path.splitext(input_filename)
+    if fmt:
+        out_ext = FORMAT_TO_EXT.get(str(fmt).upper(), ext or '.png')
+    else:
+        out_ext = ext if ext else '.png'
+    return f'{stem}{suffix}{out_ext}'
+
+
 def find_images(directory: str) -> list:
     if not os.path.isdir(directory):
         return []

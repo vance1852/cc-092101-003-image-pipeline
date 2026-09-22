@@ -209,3 +209,69 @@ class TestReportFile:
             data = json.load(f)
         assert data['summary']['total'] == 1
         assert data['summary']['succeeded'] == 1
+
+
+class TestOverlapAndFrozenDiscovery:
+
+    @pytest.fixture
+    def processed_config_path(self, tmpdir_path, simple_pipeline_config):
+        # suffix _out matches the simple pipeline fixture's output node.
+        p = os.path.join(tmpdir_path, 'pipeline.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(simple_pipeline_config, f, indent=2)
+        return p
+
+    def _png(self, path):
+        from image_pipeline.algorithms import core as alg
+        from image_pipeline.utils.image_io import write_image
+        write_image(alg.generate_gradient_image(8, 8), path, fmt='PNG')
+
+    def test_same_input_output_dir_runs_once_without_suffix_stacking(self, processed_config_path, tmpdir_path):
+        d = os.path.join(tmpdir_path, 'same')
+        os.makedirs(d)
+        self._png(os.path.join(d, 'a.png'))
+        for _ in range(3):
+            rc, out, err = _run_cli(['run', '-c', processed_config_path, '-i', d, '-o', d, '-q'])
+            assert rc == 0, err
+        assert sorted(os.listdir(d)) == ['a.png', 'a_out.png', 'batch_report.json']
+
+    def test_same_dir_quiet_still_processes_sources(self, processed_config_path, tmpdir_path):
+        d = os.path.join(tmpdir_path, 'same')
+        os.makedirs(d)
+        self._png(os.path.join(d, 'a.png'))
+        self._png(os.path.join(d, 'a_out.png'))
+        rc, out, err = _run_cli(['run', '-c', processed_config_path, '-i', d, '-o', d, '-q', '--no-report'])
+        assert rc == 0, err
+        assert os.path.isfile(os.path.join(d, 'a_out.png'))
+
+    def test_only_leftover_products_refused(self, processed_config_path, tmpdir_path):
+        d = os.path.join(tmpdir_path, 'only')
+        os.makedirs(d)
+        self._png(os.path.join(d, 'a_out.png'))
+        rc, out, err = _run_cli(['run', '-c', processed_config_path, '-i', d, '-o', d, '-q'])
+        assert rc == 3
+        assert 'pipeline_product' in err
+
+    def test_skipped_items_appear_in_receipt_and_json(self, processed_config_path, tmpdir_path):
+        d = os.path.join(tmpdir_path, 'same')
+        os.makedirs(d)
+        self._png(os.path.join(d, 'a.png'))
+        os.symlink('missing.png', os.path.join(d, 'broken.png'))
+        rc, out, err = _run_cli(['run', '-c', processed_config_path, '-i', d, '-o', d])
+        assert rc == 0, err
+        assert 'broken.png' in out
+        assert 'broken_symlink' in out
+        with open(os.path.join(d, 'batch_report.json'), 'r') as f:
+            data = json.load(f)
+        skipped_paths = {s['path'] for s in data['skipped']}
+        assert 'broken.png' in skipped_paths
+
+    def test_separate_dirs_with_suffix_named_input_unchanged(self, processed_config_path, tmpdir_path):
+        in_dir = os.path.join(tmpdir_path, 'in')
+        out_dir = os.path.join(tmpdir_path, 'out')
+        os.makedirs(in_dir)
+        # A source whose name looks like a product is fine in a separate dir.
+        self._png(os.path.join(in_dir, 'data_out.png'))
+        rc, out, err = _run_cli(['run', '-c', processed_config_path, '-i', in_dir, '-o', out_dir, '-q', '--no-report'])
+        assert rc == 0, err
+        assert os.path.isfile(os.path.join(out_dir, 'data_out_out.png'))

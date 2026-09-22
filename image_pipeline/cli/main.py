@@ -7,7 +7,14 @@ from .. import __version__
 from ..config.loader import load_config_file, validate_config_file
 from ..batch.executor import BatchExecutor, print_text_report
 from ..utils.sample_generator import generate_all
-from ..utils.image_io import find_images, SUPPORTED_EXTENSIONS
+from ..batch.discovery import discover_candidates, make_output_predictor, make_output_signature
+from ..utils.types import ValidationError
+from ..utils.image_io import predict_output_filename
+
+def _print_skipped(skipped, stream, indent='  '):
+    for item in skipped:
+        print(f'{indent}[skipped:{item.reason}] {item.relative_path}', file=stream)
+        print(f'{indent}    {item.message}', file=stream)
 
 def cmd_run(args: argparse.Namespace) -> int:
     config_path = os.path.abspath(args.config)
@@ -37,15 +44,44 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f'Output dir: {output_dir}')
         print(f"Execution order: {' -> '.join(executor.execution_order)}")
         print()
-    if not os.path.isdir(input_dir):
-        print(f'ERROR: Input directory not found: {input_dir}', file=sys.stderr)
-        return 3
-    images = find_images(input_dir)
-    if not images:
-        print(f'ERROR: No supported images found in {input_dir} (extensions: {sorted(SUPPORTED_EXTENSIONS)})', file=sys.stderr)
+    batch = BatchExecutor(executor, input_dir, output_dir, config_file=config_path)
+    # Freeze the candidate set exactly once, before the output directory is
+    # created and before any pixel is written; run() consumes this same
+    # snapshot, so two scans can never disagree.
+    try:
+        discovery = batch.discover()
+    except ValidationError as e:
+        print(f'ERROR: {e}', file=sys.stderr)
         return 3
     if not args.quiet:
-        print(f'Found {len(images)} image(s) to process.')
+        if discovery.overlap:
+            print('WARNING: input and output directories resolve to overlapping locations.')
+            print(f'  input (real) : {discovery.input_real}')
+            print(f'  output (real): {discovery.output_real}')
+            print('  Files this pipeline generates will be excluded from the inputs.')
+            print()
+        if discovery.skipped:
+            print(f'{len(discovery.skipped)} item(s) excluded from this run:')
+            _print_skipped(discovery.skipped, sys.stdout)
+            print()
+    if discovery.candidate_count == 0:
+        product_skips = [item for item in discovery.skipped
+                         if item.reason in ('planned_output', 'pipeline_product')]
+        if product_skips:
+            print('ERROR: No images to process: every image in the input directory is a file this '
+                  'pipeline would (re)generate (output directory overlaps input). Refusing to run '
+                  'to avoid re-processing generated files. Choose a separate output directory.',
+                  file=sys.stderr)
+            if args.quiet:
+                _print_skipped(discovery.skipped, sys.stderr)
+        else:
+            print('ERROR: No supported images found after applying exclusions '
+                  f'(input: {input_dir}).', file=sys.stderr)
+            if args.quiet and discovery.skipped:
+                _print_skipped(discovery.skipped, sys.stderr)
+        return 3
+    if not args.quiet:
+        print(f'Frozen {discovery.candidate_count} candidate image(s) for this run.')
     progress_cb = None
     if not args.quiet and (not args.no_progress):
 
@@ -61,8 +97,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             if done == total:
                 sys.stdout.write('\n')
         progress_cb = _progress
-    batch = BatchExecutor(executor, input_dir, output_dir, config_file=config_path, progress_callback=progress_cb)
-    report = batch.run()
+    batch.progress_callback = progress_cb
+    report = batch.run(discovery)
     if progress_cb is not None:
         sys.stdout.write('\n')
     if not args.no_report:
@@ -171,44 +207,57 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         params_str = json.dumps(node.effective_params(), sort_keys=True) if node.effective_params() else '{}'
         print(f'  {i:2d}. [{node.node_type.value:15s}] {nid:20s} params={params_str}{deps}')
     print()
-    images = find_images(input_dir) if os.path.isdir(input_dir) else []
-    print(f'--- Input Images ({len(images)} found) ---')
-    if not images:
-        if os.path.isdir(input_dir):
-            print('  (no supported images in directory)')
-        else:
-            print(f'  (input directory does not exist: {input_dir})')
+    if os.path.isdir(input_dir):
+        output_nodes_for_discovery = executor.graph.get_output_nodes()
+        discovery = discover_candidates(
+            input_dir,
+            output_dir,
+            predict_outputs=make_output_predictor(output_nodes_for_discovery),
+            recognize_product=make_output_signature(output_nodes_for_discovery),
+        )
+        images = [c.path for c in discovery.candidates]
     else:
-        for p in images:
+        discovery = None
+        images = []
+    print(f'--- Input Images ({len(images)} selected) ---')
+    if not images:
+        if not os.path.isdir(input_dir):
+            print(f'  (input directory does not exist: {input_dir})')
+        else:
+            print('  (no eligible images after exclusions)')
+    else:
+        for c in discovery.candidates:
             sz = ''
             try:
                 from ..utils.image_io import image_size
-                w, h = image_size(p)
+                w, h = image_size(c.path)
                 sz = f'  ({w}x{h})'
             except Exception:
                 pass
-            print(f'  - {os.path.basename(p)}{sz}')
+            print(f'  - {c.relative_path}{sz}')
+    if discovery is not None and discovery.skipped:
+        print()
+        print(f'--- Excluded From Input ({len(discovery.skipped)}) ---')
+        _print_skipped(discovery.skipped, sys.stdout)
+    if discovery is not None and discovery.overlap:
+        print()
+        print('NOTE: input and output directories overlap; generated files are excluded from inputs.')
     print()
     print('--- Predicted Output Files ---')
     output_nodes = executor.graph.get_output_nodes()
     if not output_nodes:
         print('  (no output nodes in pipeline - no files will be written)')
     elif not images:
-        print('  (no input images - no output files predicted)')
+        print('  (no eligible input images - no output files predicted)')
     else:
-        for img_path in images:
-            fname = os.path.basename(img_path)
-            stem, ext = os.path.splitext(fname)
+        for c in discovery.candidates:
+            fname = c.relative_path
+            base = os.path.basename(fname)
             for onode in output_nodes:
                 params = onode.effective_params()
-                suffix = params.get('suffix', '')
+                suffix = params.get('suffix', '') or ''
                 fmt = params.get('format')
-                if fmt:
-                    fmt_to_ext = {'PNG': '.png', 'JPEG': '.jpg', 'BMP': '.bmp', 'TIFF': '.tif', 'WEBP': '.webp'}
-                    out_ext = fmt_to_ext.get(str(fmt).upper(), ext or '.png')
-                else:
-                    out_ext = ext or '.png'
-                out_name = f'{stem}{suffix}{out_ext}'
+                out_name = predict_output_filename(base, suffix=suffix, fmt=fmt)
                 out_path = os.path.join(output_dir, out_name)
                 print(f'  {fname} + [{onode.node_id}] -> {out_path}')
     print()
