@@ -6,8 +6,9 @@ from typing import List, Optional
 from .. import __version__
 from ..config.loader import load_config_file, validate_config_file
 from ..batch.executor import BatchExecutor, print_text_report
+from ..utils.discovery import DiscoveryResult
 from ..utils.sample_generator import generate_all
-from ..utils.image_io import find_images, SUPPORTED_EXTENSIONS
+from ..utils.image_io import SUPPORTED_EXTENSIONS
 
 def cmd_run(args: argparse.Namespace) -> int:
     config_path = os.path.abspath(args.config)
@@ -37,15 +38,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f'Output dir: {output_dir}')
         print(f"Execution order: {' -> '.join(executor.execution_order)}")
         print()
-    if not os.path.isdir(input_dir):
-        print(f'ERROR: Input directory not found: {input_dir}', file=sys.stderr)
+    batch = BatchExecutor(executor, input_dir, output_dir, config_file=config_path)
+    try:
+        discovery = batch.discover()
+    except Exception as e:
+        print(f'ERROR: {e}', file=sys.stderr)
         return 3
-    images = find_images(input_dir)
-    if not images:
+    images = discovery.candidate_paths
+    if not images and not discovery.skipped:
         print(f'ERROR: No supported images found in {input_dir} (extensions: {sorted(SUPPORTED_EXTENSIONS)})', file=sys.stderr)
+        return 3
+    if not images:
+        print(f'ERROR: No processable images found in {input_dir}; '
+              f'{len(discovery.skipped)} entry/entries were all excluded.', file=sys.stderr)
+        for s in discovery.skipped:
+            print(f'  [SKIP] {s.rel_path}: {s.reason}', file=sys.stderr)
         return 3
     if not args.quiet:
         print(f'Found {len(images)} image(s) to process.')
+        if discovery.skipped:
+            print(f'Skipped {len(discovery.skipped)} entry/entries:')
+            for s in discovery.skipped:
+                detail = f' ({s.detail})' if s.detail else ''
+                print(f'  [SKIP] {s.rel_path}: {s.reason}{detail}')
+            print()
     progress_cb = None
     if not args.quiet and (not args.no_progress):
 
@@ -61,8 +77,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             if done == total:
                 sys.stdout.write('\n')
         progress_cb = _progress
-    batch = BatchExecutor(executor, input_dir, output_dir, config_file=config_path, progress_callback=progress_cb)
-    report = batch.run()
+    batch.progress_callback = progress_cb
+    report = batch.run(discovery)
     if progress_cb is not None:
         sys.stdout.write('\n')
     if not args.no_report:
@@ -171,15 +187,26 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         params_str = json.dumps(node.effective_params(), sort_keys=True) if node.effective_params() else '{}'
         print(f'  {i:2d}. [{node.node_type.value:15s}] {nid:20s} params={params_str}{deps}')
     print()
-    images = find_images(input_dir) if os.path.isdir(input_dir) else []
-    print(f'--- Input Images ({len(images)} found) ---')
+    batch = BatchExecutor(executor, input_dir, output_dir, config_file=config_path)
+    input_missing = not os.path.isdir(input_dir)
+    if input_missing:
+        discovery = DiscoveryResult()
+    else:
+        try:
+            discovery = batch.discover()
+        except Exception as e:
+            print(f'ERROR: {e}', file=sys.stderr)
+            return 2
+    images = discovery.candidate_paths
+    print(f'--- Input Images ({len(images)} found, {len(discovery.skipped)} skipped) ---')
     if not images:
         if os.path.isdir(input_dir):
-            print('  (no supported images in directory)')
+            print('  (no processable supported images in directory)')
         else:
             print(f'  (input directory does not exist: {input_dir})')
     else:
-        for p in images:
+        for cand in discovery.candidates:
+            p = cand.path
             sz = ''
             try:
                 from ..utils.image_io import image_size
@@ -187,7 +214,13 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
                 sz = f'  ({w}x{h})'
             except Exception:
                 pass
-            print(f'  - {os.path.basename(p)}{sz}')
+            print(f'  - {cand.rel_path}{sz}')
+    if discovery.skipped:
+        print()
+        print('--- Skipped Entries ---')
+        for s in discovery.skipped:
+            detail = f' ({s.detail})' if s.detail else ''
+            print(f'  [SKIP] {s.rel_path}: {s.reason}{detail}')
     print()
     print('--- Predicted Output Files ---')
     output_nodes = executor.graph.get_output_nodes()
@@ -196,8 +229,8 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     elif not images:
         print('  (no input images - no output files predicted)')
     else:
-        for img_path in images:
-            fname = os.path.basename(img_path)
+        for cand in discovery.candidates:
+            fname = os.path.basename(cand.display_path)
             stem, ext = os.path.splitext(fname)
             for onode in output_nodes:
                 params = onode.effective_params()
@@ -216,6 +249,7 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     print(f'  Nodes           : {len(executor.execution_order)}')
     print(f'  Edges           : {sum((len(v) for v in executor.graph.upstream.values()))}')
     print(f'  Images to process: {len(images)}')
+    print(f'  Skipped entries  : {len(discovery.skipped)}')
     print(f'  Output nodes    : {len(output_nodes)}')
     print(f'  Total output files (max): {len(images) * len(output_nodes)}')
     print()

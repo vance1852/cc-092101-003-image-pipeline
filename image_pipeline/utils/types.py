@@ -92,6 +92,18 @@ class ImageProcessingResult:
     node_results: List[NodeExecutionResult] = field(default_factory=list)
 
 @dataclass
+class SkippedItem:
+    """An entry excluded from the batch before/during processing."""
+    rel_path: str
+    reason: str
+    detail: str = ''
+    stage: str = 'discovery'
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {'path': self.rel_path, 'reason': self.reason,
+                'detail': self.detail, 'stage': self.stage}
+
+@dataclass
 class BatchReport:
     total: int = 0
     succeeded: int = 0
@@ -99,9 +111,10 @@ class BatchReport:
     skipped: int = 0
     total_duration_ms: float = 0.0
     results: List[ImageProcessingResult] = field(default_factory=list)
+    skipped_items: List[SkippedItem] = field(default_factory=list)
     pipeline_config_file: str = ''
     input_dir: str = ''
     output_dir: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
-        return {'summary': {'total': self.total, 'succeeded': self.succeeded, 'failed': self.failed, 'skipped': self.skipped, 'total_duration_ms': round(self.total_duration_ms, 2)}, 'config': {'pipeline_file': self.pipeline_config_file, 'input_dir': self.input_dir, 'output_dir': self.output_dir}, 'results': [{'input': r.input_path, 'output': r.output_path, 'success': r.success, 'duration_ms': round(r.duration_ms, 2), 'error': r.error, 'nodes': [{'node_id': nr.node_id, 'node_type': nr.node_type, 'success': nr.success, 'duration_ms': round(nr.duration_ms, 2), 'error': nr.error, 'output_size': list(nr.output_size) if nr.output_size else None} for nr in r.node_results]} for r in self.results]}
+        return {'summary': {'total': self.total, 'succeeded': self.succeeded, 'failed': self.failed, 'skipped': self.skipped, 'total_duration_ms': round(self.total_duration_ms, 2)}, 'config': {'pipeline_file': self.pipeline_config_file, 'input_dir': self.input_dir, 'output_dir': self.output_dir}, 'skipped_items': [s.to_dict() for s in self.skipped_items], 'results': [{'input': r.input_path, 'output': r.output_path, 'success': r.success, 'duration_ms': round(r.duration_ms, 2), 'error': r.error, 'nodes': [{'node_id': nr.node_id, 'node_type': nr.node_type, 'success': nr.success, 'duration_ms': round(nr.duration_ms, 2), 'error': nr.error, 'output_size': list(nr.output_size) if nr.output_size else None} for nr in r.node_results]} for r in self.results]}
